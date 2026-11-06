@@ -1,0 +1,6 @@
+# Copier en terraform.tfvars et remplir. Ne jamais publier terraform.tfvars.
+organizational_unit_parent_id = "r-xxxx" # aws organizations list-roots
+security                      = "security"
+workloads                     = "workloads"
+juice_shop_account_email      = "vous+juice-shop@example.com"
+security_account_email        = "vous+security@example.com"
