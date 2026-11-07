@@ -1,36 +1,124 @@
-# aws-hardening — Attaquer et défendre mon propre cloud
+# Home Server Infrastructure & Lab Linux
 
-Construire un environnement AWS sécurisé comme en entreprise, y déployer une application volontairement
-vulnérable (**OWASP Juice Shop**), puis l'attaquer moi-même et mesurer ce que ma défense détecte et bloque.
+Infrastructure personnelle auto-hébergée sur Raspberry Pi (Ubuntu Server), utilisée comme laboratoire
+d'administration système, d'automatisation et de sécurité sur des services réels.
 
-Guide principal : *Cloud Native Security Cookbook* (J. Armitage, O'Reilly), recettes AWS.
+> **Principe directeur : zero trust.** Aucun service d'administration n'est joignable sans passer par
+> le réseau privé Tailscale. Le réseau local n'est pas considéré comme sûr.
 
-## Feuille de route
+---
 
-| Étape | Contenu | Recettes | État |
-|---|---|---|---|
-| **1. Fondations** | Poste d'administration, sécurité du compte, organisation multi-comptes, identités | 11.2 · 2.2 · 2.5 · 2.8 | 🟡 En cours |
-| **2. Tout en code** | Infrastructure Terraform versionnée, analyse de sécurité du code | 6.2 · 6.8 · 6.11 | ⬜ |
-| **3. Réseau et données** | VPC privé, pare-feu applicatif (WAF), chiffrement | 5.x · 4.2 · 4.8 | ⬜ |
-| **4. Détection** | Journaux centralisés, alertes, conformité automatique | 3.2 · 3.5 · 3.8 · 7.x | ⬜ |
-| **5. Attaque** | Analyse puis attaque de Juice Shop, bilan défense | 9.5 | ⬜ |
-
-## Structure
+## Architecture
 
 ```
-organization/   Organisation multi-comptes (OU + comptes) — jamais détruite
-docs/           Journal de chaque étape : ce que j'ai fait, pourquoi, ce qui a coincé
+            Internet
+               │
+         [ Box / NAT ]  ── (aucune redirection, sauf exception documentée)
+               │
+        Réseau local (non fiable)
+               │ eth0
+     ┌─────────┴──────────────────────────────────────────┐
+     │  Raspberry Pi — Ubuntu Server                       │
+     │                                                     │
+     │  tailscale0 (100.x) ◄── seul point d'entrée admin   │
+     │     │                                               │
+     │     ├─ SSH :2222          (clé uniquement)          │
+     │     ├─ Caddy :8443 (TLS) ──► Vaultwarden (interne)   │
+     │     ├─ Nextcloud :8080 ──► MariaDB (interne)        │
+     │     ├─ Pi-hole :53 / :8081                          │
+     │     └─ Uptime Kuma :3001                            │
+     │                                                     │
+     │  Minecraft (Paper) :25565                           │
+     └─────────────────────────────────────────────────────┘
 ```
 
-## Journal
+| Service | Rôle | Exposition |
+|---|---|---|
+| **Caddy** | Reverse proxy TLS (certificats Tailscale) | Tailscale uniquement |
+| **Vaultwarden** | Gestionnaire de mots de passe | **Aucun port publié** : joignable seulement via Caddy, sur le réseau Docker interne |
+| **Nextcloud** + MariaDB | Stockage personnel | Tailscale uniquement ; base de données non exposée |
+| **Pi-hole** | DNS filtrant du réseau Tailscale | Tailscale uniquement |
+| **Uptime Kuma** | Supervision et alertes | Tailscale uniquement |
+| **Minecraft** (itzg/minecraft-server, Paper) | Serveur de jeu | Voir *Risques résiduels* |
 
-- [Étape 1 — Fondations](docs/01-fondations.md)
+---
 
-## Règles du projet
+## Modèle de menace
 
-- **Aucune clé d'accès permanente** : identifiants temporaires uniquement (IAM Identity Center).
-- **Alerte de budget à zéro dépense** active en permanence.
-- **`terraform destroy` à la fin de chaque séance** dès que des ressources payantes existent (jamais sur `organization/`).
-- **Chaque `terraform apply` applique un plan enregistré et relu** (`plan -out` puis `apply tfplan`).
-- **Tests d'attaque uniquement sur mes propres ressources**, dans le respect de la politique de tests d'intrusion d'AWS.
-- **Aucun identifiant de compte, aucune clé, aucun nom de domaine privé** dans ce dépôt.
+| | |
+|---|---|
+| **Actifs protégés** | Mots de passe (Vaultwarden), fichiers personnels (Nextcloud), historique DNS (vie privée), accès d'administration (SSH), disponibilité des services |
+| **Adversaires considérés** | Robots qui scannent Internet ; appareil compromis du réseau local ; appareil compromis ou oublié du réseau Tailscale |
+| **Surface d'exposition** | Interface Tailscale (`tailscale0`) pour l'administration ; port de jeu Minecraft |
+| **Hors périmètre** | Accès physique au Pi ; compromission du compte Tailscale lui-même |
+
+---
+
+## Contrôles de sécurité
+
+### Accès réseau
+- **Tailscale** (réseau maillé chiffré, basé sur WireGuard) comme unique accès d'administration, avec **ACL** limitant le SSH à mon poste de travail.
+- **ufw** en refus par défaut ; SSH autorisé **uniquement sur `tailscale0`**, avec limitation de débit (`LIMIT`).
+- **Ports Docker liés à l'adresse Tailscale** (`<TAILSCALE_IP>:port:port`) et non à `0.0.0.0`.
+  Docker écrit ses propres règles réseau, qui passent **avant** celles d'ufw : une règle ufw ne suffit donc pas à protéger un conteneur (voir l'[audit](docs/security-audit-2026-11.md)).
+- `net.ipv4.ip_nonlocal_bind = 1` pour que les conteneurs démarrent même si Tailscale n'est pas encore lancé au boot.
+
+### SSH
+Fichier `/etc/ssh/sshd_config.d/00-hardening.conf`, lu **avant** le `50-cloud-init.conf` d'Ubuntu (la première valeur lue l'emporte) :
+```
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+X11Forwarding no
+```
+Vérification de la configuration réellement appliquée : `sudo sshd -T`.
+
+### Services
+- **Vaultwarden** n'est jamais exposé directement : seul Caddy, en TLS, y accède par le réseau Docker interne.
+- **RCON Minecraft** non publié : la console reste accessible localement via `docker exec -i <conteneur> rcon-cli`.
+- Bases de données sans port publié.
+
+---
+
+## Scripts d'administration (`scripts/`)
+
+| Script | Rôle |
+|---|---|
+| `backup_project.sh` | Sauvegarde à chaud des volumes (arrêt du conteneur, archive datée `.tar.gz`, redémarrage, rotation sur 7 jours) |
+| `dockermaster.sh` | `start` / `stop` / `status` / `build` sur l'ensemble des projets Docker |
+| `rpi_health_report.sh` | Température CPU, RAM, disque, 5 processus les plus gourmands |
+| `update_system.sh` | Mises à jour du système et nettoyage des dépendances |
+
+---
+
+## Vérifier l'exposition
+
+```bash
+# Ce qui écoute sur toutes les interfaces (doit être réduit au strict minimum)
+sudo ss -tulpn | grep -E '0\.0\.0\.0|\[::\]'
+
+# Règles du pare-feu
+sudo ufw status verbose
+
+# Ports publiés par Docker
+docker ps --format "table {{.Names}}\t{{.Ports}}"
+```
+Depuis un poste du réseau Tailscale : `nmap -Pn -p <ports> <TAILSCALE_IP>`.
+
+---
+
+## Risques résiduels et améliorations prévues
+
+| Risque | Statut |
+|---|---|
+| Port Minecraft 25565 publié sur toutes les interfaces | À trancher : public volontaire (seul service exposé) ou Tailscale uniquement |
+| Images en `:latest` (Vaultwarden) et build Paper automatique | Épingler les versions pour des mises à jour maîtrisées |
+| Certificats Tailscale (~90 jours) | Automatiser le renouvellement |
+| Isolation Wi-Fi de la box utilisée comme protection implicite | Ne plus en dépendre : les services sont désormais liés à Tailscale |
+| Sauvegardes stockées sur le même appareil | Ajouter une copie hors site chiffrée |
+
+---
+
+## Historique
+
+- **2026-11** — [Audit de sécurité](docs/security-audit-2026-11.md) : 5 failles identifiées et corrigées (SSH, Docker/ufw, Vaultwarden, RCON).
